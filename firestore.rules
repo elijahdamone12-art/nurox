@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isTeacherAccount() {
+      return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function sessionDoc(sessionId) {
+      return get(/databases/$(database)/documents/sessions/$(sessionId));
+    }
+
+    function sessionData(sessionId) {
+      return sessionDoc(sessionId).data;
+    }
+
+    function ownsSession(sessionId) {
+      return isTeacherAccount() && sessionData(sessionId).teacherId == request.auth.uid;
+    }
+
+    function isCurrentUser(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function activeRoundId(sessionId) {
+      return sessionData(sessionId).activeRoundId;
+    }
+
+    function isLiveQuestionPhase(sessionId) {
+      return sessionData(sessionId).status == 'live' && sessionData(sessionId).gamePhase == 'question';
+    }
+
+    function allowedStudentPlayerUpdateKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+        'name',
+        'characterId',
+        'isReady',
+        'isConnected',
+        'lastSeenAt'
+      ]);
+    }
+
+    match /sessions/{sessionId} {
+      allow read: if signedIn();
+
+      // Teacher-owned session creation and lifecycle control.
+      allow create: if isTeacherAccount()
+        && request.resource.data.teacherId == request.auth.uid
+        && request.resource.data.status == 'draft'
+        && request.resource.data.gamePhase == 'lobby'
+        && request.resource.data.deckId is string
+        && request.resource.data.deckTitle is string
+        && request.resource.data.deckQuestionCount is int
+        && request.resource.data.defaultRoundDurationSec is int;
+
+      allow update: if ownsSession(sessionId)
+        && request.resource.data.teacherId == resource.data.teacherId;
+
+      allow delete: if false;
+
+      match /players/{playerId} {
+        allow read: if signedIn();
+
+        // Student-owned player record. Score/removal stay teacher-owned.
+        allow create: if isCurrentUser(playerId)
+          && sessionData(sessionId).status == 'lobby'
+          && request.resource.data.playerId == request.auth.uid
+          && request.resource.data.sessionId == sessionId
+          && request.resource.data.role == 'student'
+          && request.resource.data.score == 0
+          && request.resource.data.removedAt == null;
+
+        allow update: if ownsSession(sessionId)
+          || (
+            isCurrentUser(playerId)
+            && resource.data.playerId == request.auth.uid
+            && resource.data.role == 'student'
+            && request.resource.data.playerId == resource.data.playerId
+            && request.resource.data.sessionId == resource.data.sessionId
+            && request.resource.data.role == resource.data.role
+            && request.resource.data.score == resource.data.score
+            && request.resource.data.removedAt == resource.data.removedAt
+            && request.resource.data.joinedAt == resource.data.joinedAt
+            && allowedStudentPlayerUpdateKeys()
+          );
+
+        allow delete: if ownsSession(sessionId);
+      }
+
+      match /rounds/{roundId} {
+        allow read: if signedIn();
+        allow create, update, delete: if ownsSession(sessionId);
+
+        match /answers/{playerId} {
+          // Students can read only their own answer doc; teachers can inspect all.
+          allow read: if ownsSession(sessionId) || isCurrentUser(playerId);
+
+          // Student can submit exactly once for the active round while answers are open.
+          allow create: if isCurrentUser(playerId)
+            && isLiveQuestionPhase(sessionId)
+            && activeRoundId(sessionId) == roundId
+            && !exists(/databases/$(database)/documents/sessions/$(sessionId)/rounds/$(roundId)/answers/$(playerId))
+            && request.resource.data.playerId == request.auth.uid
+            && request.resource.data.roundId == roundId
+            && request.resource.data.isCorrect == null
+            && request.resource.data.pointsAwarded == 0;
+
+          // Teacher reveals/scoring updates answer correctness and points.
+          allow update: if ownsSession(sessionId);
+          allow delete: if ownsSession(sessionId);
+        }
+      }
+    }
+  }
+}
