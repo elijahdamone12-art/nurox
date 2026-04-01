@@ -1,0 +1,1144 @@
+// FILE: ./lib/sessions/service.ts
+import {
+  collection,
+  type DocumentData,
+  type DocumentSnapshot,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  type QueryDocumentSnapshot,
+  runTransaction,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  where,
+} from "firebase/firestore";
+
+import { getActiveDecks, getDeckById, getDefaultDeck } from "@/lib/game/decks";
+import {
+  ensureAnonymousAuth,
+  requireCurrentUserUid,
+  requireTeacherUser,
+} from "@/lib/firebase/client";
+import { getClientDb } from "@/lib/firebase/client";
+import type { AnswerSubmission, DeckMetadata, GamePhase, QuestionCard, Round } from "@/types/game";
+import type {
+  CharacterOption,
+  Player,
+  PlayerWithPresence,
+  Session,
+  SessionMetrics,
+  SessionStatus,
+} from "@/types/session";
+
+const SESSIONS_COLLECTION = "sessions";
+const PLAYERS_COLLECTION = "players";
+const ROUNDS_COLLECTION = "rounds";
+const ANSWERS_COLLECTION = "answers";
+const PLAYER_STALE_AFTER_MS = 30_000;
+const POINTS_PER_CORRECT_ANSWER = 100;
+const JOIN_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const DEFAULT_ROUND_DURATION_SEC = 30;
+
+const ALLOWED_SESSION_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
+  draft: ["lobby", "ended"],
+  lobby: ["starting", "ended"],
+  starting: ["live", "lobby", "ended"],
+  live: ["lobby", "ended"],
+  ended: ["draft", "lobby"],
+};
+
+const ALLOWED_GAME_PHASE_TRANSITIONS: Record<GamePhase, GamePhase[]> = {
+  lobby: ["question", "ended"],
+  question: ["locked", "ended"],
+  locked: ["reveal", "ended"],
+  reveal: ["leaderboard", "ended"],
+  leaderboard: ["question", "ended"],
+  ended: ["lobby"],
+};
+
+export const CHARACTER_OPTIONS: CharacterOption[] = [
+  { id: "nova", name: "Nova", color: "#38bdf8", emoji: ":)" },
+  { id: "bolt", name: "Bolt", color: "#2563eb", emoji: "B)" },
+  { id: "pixel", name: "Pixel", color: "#14b8a6", emoji: ":D" },
+  { id: "ember", name: "Ember", color: "#f97316", emoji: ":]" },
+  { id: "glitch", name: "Glitch", color: "#a855f7", emoji: ":P" },
+  { id: "mochi", name: "Mochi", color: "#f472b6", emoji: "^_^" },
+  { id: "atlas", name: "Atlas", color: "#22c55e", emoji: ":|" },
+  { id: "comet", name: "Comet", color: "#eab308", emoji: ":>" },
+];
+
+function sessionsCollection() {
+  return collection(getClientDb(), SESSIONS_COLLECTION);
+}
+
+function sessionDoc(sessionId: string) {
+  return doc(getClientDb(), SESSIONS_COLLECTION, sessionId);
+}
+
+function playersCollection(sessionId: string) {
+  return collection(getClientDb(), SESSIONS_COLLECTION, sessionId, PLAYERS_COLLECTION);
+}
+
+function playerDoc(sessionId: string, playerId: string) {
+  return doc(getClientDb(), SESSIONS_COLLECTION, sessionId, PLAYERS_COLLECTION, playerId);
+}
+
+function roundsCollection(sessionId: string) {
+  return collection(getClientDb(), SESSIONS_COLLECTION, sessionId, ROUNDS_COLLECTION);
+}
+
+function roundDoc(sessionId: string, roundId: string) {
+  return doc(getClientDb(), SESSIONS_COLLECTION, sessionId, ROUNDS_COLLECTION, roundId);
+}
+
+function answersCollection(sessionId: string, roundId: string) {
+  return collection(getClientDb(), SESSIONS_COLLECTION, sessionId, ROUNDS_COLLECTION, roundId, ANSWERS_COLLECTION);
+}
+
+function answerDoc(sessionId: string, roundId: string, playerId: string) {
+  return doc(
+    getClientDb(),
+    SESSIONS_COLLECTION,
+    sessionId,
+    ROUNDS_COLLECTION,
+    roundId,
+    ANSWERS_COLLECTION,
+    playerId,
+  );
+}
+
+function buildRoundId(roundIndex: number) {
+  return `round-${roundIndex + 1}`;
+}
+
+function getDeckQuestion(deckId: string, roundIndex: number) {
+  const deck = getDeckById(deckId);
+  return deck?.questions[roundIndex] ?? null;
+}
+
+function randomJoinCode(length = 6) {
+  let code = "";
+
+  for (let index = 0; index < length; index += 1) {
+    code += JOIN_CODE_CHARS[Math.floor(Math.random() * JOIN_CODE_CHARS.length)];
+  }
+
+  return code;
+}
+
+async function generateUniqueJoinCode() {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const candidate = randomJoinCode();
+    const existing = await findSessionByCode(candidate);
+
+    if (!existing) {
+      return candidate;
+    }
+  }
+
+  throw new Error("Unable to generate a unique join code right now.");
+}
+
+function buildSessionId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `session-${crypto.randomUUID().slice(0, 8)}`;
+  }
+
+  return `session-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function mapSession(snapshot: DocumentSnapshot<DocumentData>): Session | null {
+  if (!snapshot.exists()) return null;
+
+  const data = snapshot.data();
+
+  return {
+    id: snapshot.id,
+    code: String(data.code ?? ""),
+    teacherId: String(data.teacherId ?? ""),
+    mode: String(data.mode ?? "Classic"),
+    deckId: String(data.deckId ?? getDefaultDeck()?.id ?? ""),
+    deckTitle: String(data.deckTitle ?? getDefaultDeck()?.title ?? "Untitled deck"),
+    deckSubject: String(data.deckSubject ?? getDefaultDeck()?.subject ?? ""),
+    deckQuestionCount: Number(data.deckQuestionCount ?? getDefaultDeck()?.questionCount ?? 0),
+    defaultRoundDurationSec: Number(data.defaultRoundDurationSec ?? DEFAULT_ROUND_DURATION_SEC),
+    status: (data.status as SessionStatus) ?? "draft",
+    gamePhase: (data.gamePhase as GamePhase) ?? "lobby",
+    currentRoundIndex: Number(data.currentRoundIndex ?? -1),
+    activeRoundId: typeof data.activeRoundId === "string" ? data.activeRoundId : null,
+    totalRounds: Number(data.totalRounds ?? getDefaultDeck()?.questionCount ?? 0),
+    createdAt: data.createdAt ?? null,
+    updatedAt: data.updatedAt ?? null,
+    startedAt: data.startedAt ?? null,
+    endedAt: data.endedAt ?? null,
+  };
+}
+
+function mapPlayer(snapshot: QueryDocumentSnapshot<DocumentData> | DocumentSnapshot<DocumentData>): Player {
+  const data = snapshot.data() ?? {};
+
+  return {
+    id: snapshot.id,
+    playerId: String(data.playerId ?? snapshot.id),
+    sessionId: String(data.sessionId ?? ""),
+    role: "student",
+    name: String(data.name ?? "Player"),
+    characterId: String(data.characterId ?? ""),
+    joinedAt: (data.joinedAt as Player["joinedAt"]) ?? null,
+    isConnected: Boolean(data.isConnected),
+    isReady: Boolean(data.isReady),
+    score: Number(data.score ?? 0),
+    lastSeenAt: (data.lastSeenAt as Player["lastSeenAt"]) ?? null,
+    removedAt: (data.removedAt as Player["removedAt"]) ?? null,
+  };
+}
+
+function mapRound(snapshot: QueryDocumentSnapshot<DocumentData> | DocumentSnapshot<DocumentData>): Round | null {
+  if (!snapshot.exists()) return null;
+
+  const data = snapshot.data() ?? {};
+  const rawQuestion = data.question as Partial<QuestionCard> | undefined;
+
+  if (!rawQuestion?.id || !rawQuestion.prompt || !Array.isArray(rawQuestion.options)) {
+    return null;
+  }
+
+  return {
+    id: snapshot.id,
+    index: Number(data.index ?? 0),
+    questionId: String(data.questionId ?? rawQuestion.id),
+    question: {
+      id: String(rawQuestion.id),
+      prompt: String(rawQuestion.prompt),
+      options: rawQuestion.options.map((option) => ({
+        id: String(option.id),
+        text: String(option.text),
+      })),
+      correctOptionId: String(rawQuestion.correctOptionId ?? ""),
+      explanation:
+        typeof rawQuestion.explanation === "string" ? rawQuestion.explanation : undefined,
+    },
+    submittedCount: Number(data.submittedCount ?? 0),
+    correctCount: Number(data.correctCount ?? 0),
+    durationSec: Number(data.durationSec ?? DEFAULT_ROUND_DURATION_SEC),
+    roundEndsAt: data.roundEndsAt ?? null,
+    pointsAwarded: Boolean(data.pointsAwarded),
+    createdAt: data.createdAt ?? null,
+    lockedAt: data.lockedAt ?? null,
+    revealedAt: data.revealedAt ?? null,
+  };
+}
+
+function mapAnswer(
+  snapshot: QueryDocumentSnapshot<DocumentData> | DocumentSnapshot<DocumentData>,
+): AnswerSubmission | null {
+  if (!snapshot.exists()) return null;
+
+  const data = snapshot.data() ?? {};
+
+  return {
+    id: snapshot.id,
+    playerId: String(data.playerId ?? snapshot.id),
+    roundId: String(data.roundId ?? ""),
+    roundIndex: Number(data.roundIndex ?? 0),
+    answerOptionId: String(data.answerOptionId ?? ""),
+    submittedAt: (data.submittedAt as AnswerSubmission["submittedAt"]) ?? null,
+    isCorrect:
+      typeof data.isCorrect === "boolean" ? data.isCorrect : null,
+    pointsAwarded: Number(data.pointsAwarded ?? 0),
+  };
+}
+
+async function transitionSessionStatus(sessionId: string, toStatus: SessionStatus) {
+  await runTransaction(getClientDb(), async (transaction) => {
+    const sessionReference = sessionDoc(sessionId);
+    const snapshot = await transaction.get(sessionReference);
+
+    if (!snapshot.exists()) {
+      throw new Error("Session not found.");
+    }
+
+    const session = mapSession(snapshot);
+    if (!session) {
+      throw new Error("Session not found.");
+    }
+
+    if (!ALLOWED_SESSION_TRANSITIONS[session.status].includes(toStatus)) {
+      throw new Error(`Invalid session transition: ${session.status} -> ${toStatus}`);
+    }
+
+    const patch: Record<string, unknown> = {
+      status: toStatus,
+      updatedAt: serverTimestamp(),
+    };
+
+    if (toStatus === "live") {
+      patch.startedAt = serverTimestamp();
+      patch.endedAt = null;
+    }
+
+    if (toStatus === "ended") {
+      patch.endedAt = serverTimestamp();
+      patch.gamePhase = "ended";
+    }
+
+    if (toStatus === "lobby") {
+      patch.endedAt = null;
+      patch.gamePhase = "lobby";
+      patch.currentRoundIndex = -1;
+      patch.activeRoundId = null;
+    }
+
+    transaction.update(sessionReference, patch);
+  });
+}
+
+async function requireTeacherOwnedSession(sessionId: string) {
+  const teacher = requireTeacherUser();
+  const session = await getSession(sessionId);
+
+  if (!session) {
+    throw new Error("Session not found.");
+  }
+
+  if (session.teacherId !== teacher.uid) {
+    throw new Error("You do not own this session.");
+  }
+
+  return { teacher, session };
+}
+
+async function transitionGamePhase(
+  sessionId: string,
+  fromPhase: GamePhase,
+  toPhase: GamePhase,
+  patch: Record<string, unknown> = {},
+) {
+  if (!ALLOWED_GAME_PHASE_TRANSITIONS[fromPhase].includes(toPhase)) {
+    throw new Error(`Invalid game phase transition: ${fromPhase} -> ${toPhase}`);
+  }
+
+  await updateDoc(sessionDoc(sessionId), {
+    gamePhase: toPhase,
+    updatedAt: serverTimestamp(),
+    ...patch,
+  });
+}
+
+async function clearRoundData(sessionId: string) {
+  const roundsSnapshot = await getDocs(roundsCollection(sessionId));
+
+  for (const roundSnapshot of roundsSnapshot.docs) {
+    const answersSnapshot = await getDocs(answersCollection(sessionId, roundSnapshot.id));
+    await Promise.all(answersSnapshot.docs.map((answerSnapshot) => deleteDoc(answerSnapshot.ref)));
+    await deleteDoc(roundSnapshot.ref);
+  }
+}
+
+function sanitizeQuestion(question: QuestionCard) {
+  return {
+    id: question.id,
+    prompt: question.prompt,
+    options: question.options.map((option) => ({ id: option.id, text: option.text })),
+    correctOptionId: question.correctOptionId,
+    ...(question.explanation ? { explanation: question.explanation } : {}),
+  };
+}
+
+export function normalizeJoinCode(code: string) {
+  return code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+export function getCharacterById(characterId: string) {
+  return CHARACTER_OPTIONS.find((character) => character.id === characterId) ?? null;
+}
+
+export function isValidSessionId(sessionId: string) {
+  return /^[A-Za-z0-9_-]{3,64}$/.test(sessionId);
+}
+
+export function isSessionJoinable(status: SessionStatus) {
+  return status === "lobby";
+}
+
+export function isSessionPlayable(status: SessionStatus) {
+  return status === "starting" || status === "live";
+}
+
+export function isGamePhaseAnswerable(phase: GamePhase) {
+  return phase === "question";
+}
+
+export function isStatusTransitionAllowed(from: SessionStatus, to: SessionStatus) {
+  return ALLOWED_SESSION_TRANSITIONS[from].includes(to);
+}
+
+export function getPlayerPresence(player: Player, now = Date.now()) {
+  if (!player.isConnected) {
+    return "offline" as const;
+  }
+
+  const lastSeen = player.lastSeenAt?.toMillis();
+  if (!lastSeen) {
+    return "stale" as const;
+  }
+
+  return now - lastSeen > PLAYER_STALE_AFTER_MS ? "stale" : "connected";
+}
+
+export function withDerivedPresence(players: Player[], now = Date.now()): PlayerWithPresence[] {
+  return players.map((player) => ({
+    ...player,
+    presence: getPlayerPresence(player, now),
+  }));
+}
+
+export function getSessionMetrics(players: Player[]): SessionMetrics {
+  const roster = withDerivedPresence(players);
+
+  return {
+    totalPlayers: roster.length,
+    connectedPlayers: roster.filter((player) => player.presence === "connected").length,
+    readyPlayers: roster.filter((player) => player.isReady).length,
+    stalePlayers: roster.filter((player) => player.presence === "stale").length,
+  };
+}
+
+export function getAvailableDecks() {
+  return getActiveDecks();
+}
+
+export function getQuestionDeckSize(deckId: string) {
+  return getDeckById(deckId)?.questionCount ?? 0;
+}
+
+export function getQuestionPreview(deckId: string, roundIndex: number) {
+  return getDeckQuestion(deckId, roundIndex);
+}
+
+export async function findSessionByCode(code: string) {
+  const normalizedCode = normalizeJoinCode(code);
+
+  if (!normalizedCode) {
+    return null;
+  }
+
+  const snapshot = await getDocs(
+    query(sessionsCollection(), where("code", "==", normalizedCode), limit(1)),
+  );
+
+  if (snapshot.empty) {
+    return null;
+  }
+
+  return mapSession(snapshot.docs[0]);
+}
+
+export async function getSession(sessionId: string) {
+  return mapSession(await getDoc(sessionDoc(sessionId)));
+}
+
+export async function getRecentOwnedSessions(limitCount = 8) {
+  const teacher = requireTeacherUser();
+  const snapshot = await getDocs(
+    query(
+      sessionsCollection(),
+      where("teacherId", "==", teacher.uid),
+      orderBy("createdAt", "desc"),
+      limit(limitCount),
+    ),
+  );
+
+  return snapshot.docs.map((document) => mapSession(document)).filter(Boolean) as Session[];
+}
+
+export async function getPlayerInSession(sessionId: string, playerId: string) {
+  const snapshot = await getDoc(playerDoc(sessionId, playerId));
+  if (!snapshot.exists()) {
+    return null;
+  }
+
+  return mapPlayer(snapshot);
+}
+
+export async function getCurrentRound(sessionId: string) {
+  const session = await getSession(sessionId);
+  if (!session?.activeRoundId) {
+    return null;
+  }
+
+  return mapRound(await getDoc(roundDoc(sessionId, session.activeRoundId)));
+}
+
+export async function joinSessionByCode(input: {
+  code: string;
+  name: string;
+  characterId: string;
+}) {
+  const student = await ensureAnonymousAuth();
+  if (!student.isAnonymous) {
+    throw new Error("Teacher accounts must use a separate student browser session to join games.");
+  }
+
+  const session = await findSessionByCode(input.code);
+
+  if (!session) {
+    throw new Error("Session not found.");
+  }
+
+  await upsertOwnPlayerInSession({
+    sessionId: session.id,
+    playerId: student.uid,
+    name: input.name,
+    characterId: input.characterId,
+  });
+
+  return {
+    session,
+    playerId: student.uid,
+  };
+}
+
+export async function upsertOwnPlayerInSession(input: {
+  sessionId: string;
+  playerId: string;
+  name: string;
+  characterId: string;
+}) {
+  requireCurrentUserUid(input.playerId);
+
+  await runTransaction(getClientDb(), async (transaction) => {
+    const sessionReference = sessionDoc(input.sessionId);
+    const playerReference = playerDoc(input.sessionId, input.playerId);
+
+    const sessionSnapshot = await transaction.get(sessionReference);
+    if (!sessionSnapshot.exists()) {
+      throw new Error("Session not found.");
+    }
+
+    const session = mapSession(sessionSnapshot);
+    if (!session || !isSessionJoinable(session.status)) {
+      throw new Error("Session is not accepting players.");
+    }
+
+    const playerSnapshot = await transaction.get(playerReference);
+    const existing = playerSnapshot.exists() ? mapPlayer(playerSnapshot) : null;
+
+    transaction.set(
+      playerReference,
+      {
+        playerId: input.playerId,
+        sessionId: input.sessionId,
+        role: "student",
+        name: input.name.trim(),
+        characterId: input.characterId,
+        joinedAt: existing?.joinedAt ?? serverTimestamp(),
+        isConnected: true,
+        isReady: false,
+        score: existing?.score ?? 0,
+        lastSeenAt: serverTimestamp(),
+        removedAt: null,
+      },
+      { merge: true },
+    );
+  });
+}
+
+export async function heartbeatOwnPresence(
+  sessionId: string,
+  playerId: string,
+  input: {
+    isConnected: boolean;
+    isReady?: boolean;
+  },
+) {
+  requireCurrentUserUid(playerId);
+
+  await setDoc(
+    playerDoc(sessionId, playerId),
+    {
+      isConnected: input.isConnected,
+      lastSeenAt: serverTimestamp(),
+      ...(typeof input.isReady === "boolean" ? { isReady: input.isReady } : {}),
+    },
+    { merge: true },
+  );
+}
+
+export async function setOwnReadyState(
+  sessionId: string,
+  playerId: string,
+  isReady: boolean,
+) {
+  await heartbeatOwnPresence(sessionId, playerId, { isConnected: true, isReady });
+}
+
+export async function markOwnPlayerDisconnectedBestEffort(sessionId: string, playerId: string) {
+  try {
+    await heartbeatOwnPresence(sessionId, playerId, { isConnected: false });
+  } catch {
+    return;
+  }
+}
+
+export async function removePlayerFromOwnedSession(sessionId: string, playerId: string) {
+  await requireTeacherOwnedSession(sessionId);
+  await deleteDoc(playerDoc(sessionId, playerId));
+}
+
+export async function submitOwnAnswer(
+  sessionId: string,
+  playerId: string,
+  answerOptionId: string,
+) {
+  requireCurrentUserUid(playerId);
+
+  await runTransaction(getClientDb(), async (transaction) => {
+    const sessionReference = sessionDoc(sessionId);
+    const sessionSnapshot = await transaction.get(sessionReference);
+
+    if (!sessionSnapshot.exists()) {
+      throw new Error("Session not found.");
+    }
+
+    const session = mapSession(sessionSnapshot);
+    if (!session || session.status !== "live" || session.gamePhase !== "question" || !session.activeRoundId) {
+      throw new Error("Answers are not being accepted right now.");
+    }
+
+    const playerReference = playerDoc(sessionId, playerId);
+    const playerSnapshot = await transaction.get(playerReference);
+    if (!playerSnapshot.exists()) {
+      throw new Error("Player not found.");
+    }
+
+    const roundReference = roundDoc(sessionId, session.activeRoundId);
+    const roundSnapshot = await transaction.get(roundReference);
+    const round = mapRound(roundSnapshot);
+    if (!round) {
+      throw new Error("Round not found.");
+    }
+
+    if (!round.question.options.some((option) => option.id === answerOptionId)) {
+      throw new Error("Answer option is invalid.");
+    }
+
+    const answerReference = answerDoc(sessionId, round.id, playerId);
+    const answerSnapshot = await transaction.get(answerReference);
+    if (answerSnapshot.exists()) {
+      throw new Error("You have already answered this round.");
+    }
+
+    transaction.set(answerReference, {
+      playerId,
+      roundId: round.id,
+      roundIndex: round.index,
+      answerOptionId,
+      submittedAt: serverTimestamp(),
+      isCorrect: null,
+      pointsAwarded: 0,
+    });
+
+    transaction.update(roundReference, {
+      submittedCount: round.submittedCount + 1,
+    });
+  });
+}
+
+export async function startOwnedSession(sessionId: string) {
+  const { session } = await requireTeacherOwnedSession(sessionId);
+  if (!session.deckId) {
+    throw new Error("A deck must be selected before the session can start.");
+  }
+
+  const playersSnapshot = await getDocs(playersCollection(sessionId));
+  const players = playersSnapshot.docs.map((document) => mapPlayer(document));
+  const metrics = getSessionMetrics(players);
+
+  if (metrics.connectedPlayers < 1) {
+    throw new Error("At least one connected player is required to start.");
+  }
+
+  await runTransaction(getClientDb(), async (transaction) => {
+    const sessionReference = sessionDoc(sessionId);
+    const sessionSnapshot = await transaction.get(sessionReference);
+
+    if (!sessionSnapshot.exists()) {
+      throw new Error("Session not found.");
+    }
+
+    const session = mapSession(sessionSnapshot);
+    if (!session || !isStatusTransitionAllowed(session.status, "starting")) {
+      throw new Error("Session cannot be started right now.");
+    }
+
+    transaction.update(sessionReference, {
+      status: "starting",
+      gamePhase: "lobby",
+      currentRoundIndex: -1,
+      activeRoundId: null,
+      totalRounds: session.deckQuestionCount,
+      updatedAt: serverTimestamp(),
+      endedAt: null,
+    });
+  });
+
+  window.setTimeout(() => {
+    runTransaction(getClientDb(), async (transaction) => {
+      const sessionReference = sessionDoc(sessionId);
+      const sessionSnapshot = await transaction.get(sessionReference);
+      const session = mapSession(sessionSnapshot);
+
+      if (!session || session.status !== "starting") {
+        return;
+      }
+
+      transaction.update(sessionReference, {
+        status: "live",
+        gamePhase: "lobby",
+        updatedAt: serverTimestamp(),
+        startedAt: serverTimestamp(),
+      });
+    }).catch(() => undefined);
+  }, 1200);
+}
+
+export async function startOwnedNextRound(
+  sessionId: string,
+  options?: {
+    durationSec?: number;
+  },
+) {
+  await requireTeacherOwnedSession(sessionId);
+  await runTransaction(getClientDb(), async (transaction) => {
+    const sessionReference = sessionDoc(sessionId);
+    const sessionSnapshot = await transaction.get(sessionReference);
+
+    if (!sessionSnapshot.exists()) {
+      throw new Error("Session not found.");
+    }
+
+    const session = mapSession(sessionSnapshot);
+    if (!session || session.status !== "live") {
+      throw new Error("Session is not in a live game state.");
+    }
+
+    if (!["lobby", "leaderboard"].includes(session.gamePhase)) {
+      throw new Error("Cannot start a new round right now.");
+    }
+
+    const nextRoundIndex = session.currentRoundIndex + 1;
+    const question = getDeckQuestion(session.deckId, nextRoundIndex);
+
+    if (!question) {
+      transaction.update(sessionReference, {
+        gamePhase: "ended",
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    }
+
+    const nextRoundId = buildRoundId(nextRoundIndex);
+    const durationSec =
+      options?.durationSec && options.durationSec > 0
+        ? Math.floor(options.durationSec)
+        : session.defaultRoundDurationSec;
+    const roundEndsAt = new Date(Date.now() + durationSec * 1000);
+
+    transaction.set(roundDoc(sessionId, nextRoundId), {
+      index: nextRoundIndex,
+      questionId: question.id,
+      question: sanitizeQuestion(question),
+      submittedCount: 0,
+      correctCount: 0,
+      durationSec,
+      roundEndsAt,
+      pointsAwarded: false,
+      createdAt: serverTimestamp(),
+      lockedAt: null,
+      revealedAt: null,
+    });
+
+    transaction.update(sessionReference, {
+      gamePhase: "question",
+      currentRoundIndex: nextRoundIndex,
+      activeRoundId: nextRoundId,
+      totalRounds: session.deckQuestionCount,
+      updatedAt: serverTimestamp(),
+    });
+  });
+}
+
+export async function lockOwnedRound(sessionId: string) {
+  await requireTeacherOwnedSession(sessionId);
+  const session = await getSession(sessionId);
+  if (!session || session.status !== "live" || session.gamePhase !== "question" || !session.activeRoundId) {
+    throw new Error("There is no active question to lock.");
+  }
+
+  await updateDoc(roundDoc(sessionId, session.activeRoundId), {
+    lockedAt: serverTimestamp(),
+    roundEndsAt: null,
+  });
+
+  await transitionGamePhase(sessionId, "question", "locked");
+}
+
+export async function revealOwnedRound(sessionId: string) {
+  await requireTeacherOwnedSession(sessionId);
+  const session = await getSession(sessionId);
+  if (!session || session.status !== "live" || session.gamePhase !== "locked" || !session.activeRoundId) {
+    throw new Error("There is no locked round to reveal.");
+  }
+
+  const round = await getCurrentRound(sessionId);
+  if (!round) {
+    throw new Error("Round not found.");
+  }
+
+  const answersSnapshot = await getDocs(answersCollection(sessionId, round.id));
+  const answers = answersSnapshot.docs.map((document) => mapAnswer(document)).filter(Boolean) as AnswerSubmission[];
+  const correctPlayerIds = answers
+    .filter((answer) => answer.answerOptionId === round.question.correctOptionId)
+    .map((answer) => answer.playerId);
+
+  await runTransaction(getClientDb(), async (transaction) => {
+    const sessionReference = sessionDoc(sessionId);
+    const sessionSnapshot = await transaction.get(sessionReference);
+
+    if (!sessionSnapshot.exists()) {
+      throw new Error("Session not found.");
+    }
+
+    const sessionInTxn = mapSession(sessionSnapshot);
+    if (!sessionInTxn || sessionInTxn.status !== "live" || sessionInTxn.gamePhase !== "locked" || !sessionInTxn.activeRoundId) {
+      throw new Error("There is no locked round to reveal.");
+    }
+
+    const roundReference = roundDoc(sessionId, sessionInTxn.activeRoundId);
+    const roundSnapshot = await transaction.get(roundReference);
+    const roundInTxn = mapRound(roundSnapshot);
+    if (!roundInTxn) {
+      throw new Error("Round not found.");
+    }
+
+    const playersToScore = await Promise.all(
+      correctPlayerIds.map(async (playerId) => {
+        const playerReference = playerDoc(sessionId, playerId);
+        const playerSnapshot = await transaction.get(playerReference);
+        const player = playerSnapshot.exists() ? mapPlayer(playerSnapshot) : null;
+
+        return { player, playerReference };
+      }),
+    );
+
+    transaction.update(roundReference, {
+      revealedAt: serverTimestamp(),
+      correctCount: correctPlayerIds.length,
+      pointsAwarded: true,
+    });
+
+    for (const answerSnapshot of answersSnapshot.docs) {
+      const answer = mapAnswer(answerSnapshot);
+      if (!answer || answer.isCorrect !== null) {
+        continue;
+      }
+
+      const isCorrect = answer.answerOptionId === roundInTxn.question.correctOptionId;
+      const pointsAwarded = isCorrect ? POINTS_PER_CORRECT_ANSWER : 0;
+      transaction.update(answerSnapshot.ref, {
+        isCorrect,
+        pointsAwarded,
+      });
+    }
+
+    for (const { player, playerReference } of playersToScore) {
+      if (!player) {
+        continue;
+      }
+
+      transaction.update(playerReference, {
+        score: player.score + POINTS_PER_CORRECT_ANSWER,
+      });
+    }
+
+    transaction.update(sessionReference, {
+      gamePhase: "reveal",
+      updatedAt: serverTimestamp(),
+    });
+  });
+}
+
+export async function showOwnedLeaderboard(sessionId: string) {
+  await requireTeacherOwnedSession(sessionId);
+  const session = await getSession(sessionId);
+  if (!session || session.status !== "live") {
+    throw new Error("Session is not live.");
+  }
+
+  await transitionGamePhase(sessionId, "reveal", "leaderboard");
+}
+
+export async function finishOwnedGame(sessionId: string) {
+  await requireTeacherOwnedSession(sessionId);
+  const session = await getSession(sessionId);
+  if (!session || session.status !== "live") {
+    throw new Error("Session is not live.");
+  }
+
+  await transitionGamePhase(sessionId, session.gamePhase, "ended");
+}
+
+export async function endOwnedSession(sessionId: string) {
+  const { session } = await requireTeacherOwnedSession(sessionId);
+
+  if (!isStatusTransitionAllowed(session.status, "ended")) {
+    throw new Error("Session cannot be ended right now.");
+  }
+
+  await transitionSessionStatus(sessionId, "ended");
+}
+
+export async function resetOwnedSessionToLobby(sessionId: string) {
+  const { session } = await requireTeacherOwnedSession(sessionId);
+
+  if (!isStatusTransitionAllowed(session.status, "lobby")) {
+    throw new Error("Session cannot be moved back to the lobby.");
+  }
+
+  await clearRoundData(sessionId);
+  await transitionSessionStatus(sessionId, "lobby");
+
+  const playersSnapshot = await getDocs(playersCollection(sessionId));
+  await Promise.all(
+    playersSnapshot.docs.map((document) =>
+      updateDoc(document.ref, {
+        isReady: false,
+        isConnected: false,
+        score: 0,
+      }),
+    ),
+  );
+}
+
+export async function openOwnedSessionLobby(sessionId: string) {
+  const { session } = await requireTeacherOwnedSession(sessionId);
+
+  if (session.status !== "draft") {
+    throw new Error("Only draft sessions can be opened to the lobby.");
+  }
+
+  await transitionSessionStatus(sessionId, "lobby");
+}
+
+export async function createTeacherSession(input: {
+  deckId: string;
+  sessionId?: string;
+  defaultRoundDurationSec?: number;
+}) {
+  const teacher = requireTeacherUser();
+  const deck = getDeckById(input.deckId);
+
+  if (!deck || !deck.isActive) {
+    throw new Error("That deck is not available.");
+  }
+
+  const sessionId = input.sessionId ?? buildSessionId();
+  const existingSession = await getSession(sessionId);
+
+  if (existingSession) {
+    if (existingSession.teacherId !== teacher.uid) {
+      throw new Error("This session is owned by another teacher.");
+    }
+    return existingSession;
+  }
+
+  const code = await generateUniqueJoinCode();
+
+  await setDoc(sessionDoc(sessionId), {
+    code,
+    teacherId: teacher.uid,
+    mode: "Classic",
+    deckId: deck.id,
+    deckTitle: deck.title,
+    deckSubject: deck.subject,
+    deckQuestionCount: deck.questionCount,
+    defaultRoundDurationSec:
+      input.defaultRoundDurationSec && input.defaultRoundDurationSec > 0
+        ? Math.floor(input.defaultRoundDurationSec)
+        : DEFAULT_ROUND_DURATION_SEC,
+    status: "draft",
+    gamePhase: "lobby",
+    currentRoundIndex: -1,
+    activeRoundId: null,
+    totalRounds: deck.questionCount,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+    startedAt: null,
+    endedAt: null,
+  });
+
+  return getSession(sessionId);
+}
+
+export function subscribeToSession(
+  sessionId: string,
+  callback: (session: Session | null) => void,
+  onError?: (error: Error) => void,
+) {
+  return onSnapshot(
+    sessionDoc(sessionId),
+    (snapshot) => {
+      callback(mapSession(snapshot));
+    },
+    (error) => {
+      onError?.(error);
+    },
+  );
+}
+
+export function subscribeToRecentOwnedSessions(
+  callback: (sessions: Session[]) => void,
+  onError?: (error: Error) => void,
+  limitCount = 8,
+) {
+  const teacher = requireTeacherUser();
+
+  return onSnapshot(
+    query(
+      sessionsCollection(),
+      where("teacherId", "==", teacher.uid),
+      orderBy("createdAt", "desc"),
+      limit(limitCount),
+    ),
+    (snapshot) => {
+      const sessions = snapshot.docs.map((document) => mapSession(document)).filter(Boolean) as Session[];
+      callback(sessions);
+    },
+    (error) => {
+      onError?.(error);
+    },
+  );
+}
+
+export function subscribeToPlayers(
+  sessionId: string,
+  callback: (players: Player[]) => void,
+  onError?: (error: Error) => void,
+) {
+  return onSnapshot(
+    playersCollection(sessionId),
+    (snapshot) => {
+      const players = snapshot.docs
+        .map((document) => mapPlayer(document))
+        .filter((player) => !player.removedAt)
+        .sort((left, right) => left.name.localeCompare(right.name));
+
+      callback(players);
+    },
+    (error) => {
+      onError?.(error);
+    },
+  );
+}
+
+export function subscribeToCurrentRound(
+  sessionId: string,
+  roundId: string | null,
+  callback: (round: Round | null) => void,
+  onError?: (error: Error) => void,
+) {
+  if (!roundId) {
+    callback(null);
+    return () => undefined;
+  }
+
+  return onSnapshot(
+    roundDoc(sessionId, roundId),
+    (snapshot) => {
+      callback(mapRound(snapshot));
+    },
+    (error) => {
+      onError?.(error);
+    },
+  );
+}
+
+export function subscribeToRoundAnswers(
+  sessionId: string,
+  roundId: string | null,
+  callback: (answers: AnswerSubmission[]) => void,
+  onError?: (error: Error) => void,
+) {
+  if (!roundId) {
+    callback([]);
+    return () => undefined;
+  }
+
+  return onSnapshot(
+    query(answersCollection(sessionId, roundId), orderBy("submittedAt", "asc")),
+    (snapshot) => {
+      callback(snapshot.docs.map((document) => mapAnswer(document)).filter(Boolean) as AnswerSubmission[]);
+    },
+    (error) => {
+      onError?.(error);
+    },
+  );
+}
+
+export function subscribeToOwnRoundAnswer(
+  sessionId: string,
+  roundId: string | null,
+  playerId: string | null,
+  callback: (answer: AnswerSubmission | null) => void,
+  onError?: (error: Error) => void,
+) {
+  if (!roundId || !playerId) {
+    callback(null);
+    return () => undefined;
+  }
+
+  return onSnapshot(
+    answerDoc(sessionId, roundId, playerId),
+    (snapshot) => {
+      callback(mapAnswer(snapshot));
+    },
+    (error) => {
+      onError?.(error);
+    },
+  );
+}
+
+// Compatibility wrappers for existing milestones while teacher/student pages move to explicit actor APIs.
+export const upsertPlayerInSession = upsertOwnPlayerInSession;
+export const updatePlayerPresence = heartbeatOwnPresence;
+export const setPlayerReadyState = setOwnReadyState;
+export const removePlayerFromSession = removePlayerFromOwnedSession;
+export const submitPlayerAnswer = submitOwnAnswer;
+export const startSession = startOwnedSession;
+export const startNextRound = startOwnedNextRound;
+export const lockCurrentRound = lockOwnedRound;
+export const revealCurrentRound = revealOwnedRound;
+export const showLeaderboard = showOwnedLeaderboard;
+export const finishGame = finishOwnedGame;
+export const endSession = endOwnedSession;
+export const resetSessionToLobby = resetOwnedSessionToLobby;
+export async function createLocalTestSession(sessionId: string) {
+  const deck = getDefaultDeck();
+
+  if (!deck) {
+    throw new Error("No decks are available.");
+  }
+
+  return createTeacherSession({
+    sessionId,
+    deckId: deck.id,
+  });
+}
+
