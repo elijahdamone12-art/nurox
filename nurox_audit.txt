@@ -1,3 +1,4 @@
+// FILE: ./lib/sessions/service.ts
 import {
   collection,
   type DocumentData,
@@ -172,7 +173,6 @@ function mapSession(snapshot: DocumentSnapshot<DocumentData>): Session | null {
     currentRoundIndex: Number(data.currentRoundIndex ?? -1),
     activeRoundId: typeof data.activeRoundId === "string" ? data.activeRoundId : null,
     totalRounds: Number(data.totalRounds ?? getDefaultDeck()?.questionCount ?? 0),
-    assignmentId: typeof data.assignmentId === "string" ? data.assignmentId : undefined,
     createdAt: data.createdAt ?? null,
     updatedAt: data.updatedAt ?? null,
     startedAt: data.startedAt ?? null,
@@ -223,10 +223,6 @@ function mapRound(snapshot: QueryDocumentSnapshot<DocumentData> | DocumentSnapsh
       correctOptionId: String(rawQuestion.correctOptionId ?? ""),
       explanation:
         typeof rawQuestion.explanation === "string" ? rawQuestion.explanation : undefined,
-      standardsTags: Array.isArray(rawQuestion.standardsTags)
-        ? (rawQuestion.standardsTags as string[])
-        : undefined,
-      difficulty: (rawQuestion.difficulty as QuestionCard["difficulty"]) ?? undefined,
     },
     submittedCount: Number(data.submittedCount ?? 0),
     correctCount: Number(data.correctCount ?? 0),
@@ -352,8 +348,6 @@ function sanitizeQuestion(question: QuestionCard) {
     options: question.options.map((option) => ({ id: option.id, text: option.text })),
     correctOptionId: question.correctOptionId,
     ...(question.explanation ? { explanation: question.explanation } : {}),
-    ...(question.standardsTags?.length ? { standardsTags: question.standardsTags } : {}),
-    ...(question.difficulty ? { difficulty: question.difficulty } : {}),
   };
 }
 
@@ -715,15 +709,6 @@ export async function startOwnedSession(sessionId: string) {
   }, 1200);
 }
 
-async function getNextRoundQuestion(session: Session, roundIndex: number) {
-  if (session.assignmentId) {
-    const { getAssignment } = await import("@/lib/assignments/service");
-    const assignment = await getAssignment(session.assignmentId);
-    return assignment?.questions.find((q) => q.order === roundIndex)?.questionCard ?? null;
-  }
-  return getDeckQuestion(session.deckId, roundIndex);
-}
-
 export async function startOwnedNextRound(
   sessionId: string,
   options?: {
@@ -731,21 +716,6 @@ export async function startOwnedNextRound(
   },
 ) {
   await requireTeacherOwnedSession(sessionId);
-
-  // Fetch the question and assignment metadata outside the transaction — Firestore
-  // transactions must not perform async work on external collections.
-  const preflightSession = await getSession(sessionId);
-  if (!preflightSession) throw new Error("Session not found.");
-  const nextRoundIndex = preflightSession.currentRoundIndex + 1;
-  const question = await getNextRoundQuestion(preflightSession, nextRoundIndex);
-
-  let assignmentTotalRounds: number | undefined;
-  if (preflightSession.assignmentId) {
-    const { getAssignment } = await import("@/lib/assignments/service");
-    const assignment = await getAssignment(preflightSession.assignmentId);
-    assignmentTotalRounds = assignment?.questionCount;
-  }
-
   await runTransaction(getClientDb(), async (transaction) => {
     const sessionReference = sessionDoc(sessionId);
     const sessionSnapshot = await transaction.get(sessionReference);
@@ -762,6 +732,9 @@ export async function startOwnedNextRound(
     if (!["lobby", "leaderboard"].includes(session.gamePhase)) {
       throw new Error("Cannot start a new round right now.");
     }
+
+    const nextRoundIndex = session.currentRoundIndex + 1;
+    const question = getDeckQuestion(session.deckId, nextRoundIndex);
 
     if (!question) {
       transaction.update(sessionReference, {
@@ -792,13 +765,11 @@ export async function startOwnedNextRound(
       revealedAt: null,
     });
 
-    const totalRounds = assignmentTotalRounds ?? session.deckQuestionCount;
-
     transaction.update(sessionReference, {
       gamePhase: "question",
       currentRoundIndex: nextRoundIndex,
       activeRoundId: nextRoundId,
-      totalRounds,
+      totalRounds: session.deckQuestionCount,
       updatedAt: serverTimestamp(),
     });
   });
@@ -902,24 +873,6 @@ export async function revealOwnedRound(sessionId: string) {
       updatedAt: serverTimestamp(),
     });
   });
-
-  // Persist weakTags for each player fire-and-forget — never block the reveal flow.
-  const { gradeAnswers, persistWeakTags } = await import("@/lib/grading");
-  const answersAfterReveal = await getDocs(answersCollection(sessionId, round.id));
-  const roundAfterReveal = await getCurrentRound(sessionId);
-  if (roundAfterReveal) {
-    const playerAnswerGroups = new Map<string, string>();
-    for (const snap of answersAfterReveal.docs) {
-      const a = mapAnswer(snap);
-      if (a) playerAnswerGroups.set(a.playerId, a.answerOptionId);
-    }
-    for (const [playerId, chosenOptionId] of playerAnswerGroups) {
-      const result = gradeAnswers([
-        { questionCard: roundAfterReveal.question, chosenOptionId },
-      ]);
-      persistWeakTags(playerId, result).catch(() => undefined);
-    }
-  }
 }
 
 export async function showOwnedLeaderboard(sessionId: string) {
@@ -1188,3 +1141,4 @@ export async function createLocalTestSession(sessionId: string) {
     deckId: deck.id,
   });
 }
+

@@ -18,6 +18,7 @@ export type Session = {
   currentRoundIndex: number;
   activeRoundId: string | null;
   totalRounds: number;
+  assignmentId?: string;
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;
   startedAt: Timestamp | null;

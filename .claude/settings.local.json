@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"standards\\\\|TEKS\\\\|grading\\\\|QuestionCard\" . --include=*.ts --include=*.tsx)",
+      "Bash(ls /c/Users/14692/nurox/nurox/.claude/worktrees/inspiring-cannon/app/teacher/session/[sessionId]/)",
+      "Bash(ls /c/Users/14692/nurox/nurox/.claude/worktrees/inspiring-cannon/app/game/[sessionId]/)",
+      "Bash(npm install:*)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}
