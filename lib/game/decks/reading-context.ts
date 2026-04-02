@@ -21,6 +21,8 @@ export const READING_CONTEXT_DECK: QuestionDeck = {
       ],
       correctOptionId: "b",
       explanation: "Hesitant usually means unsure or slow to act.",
+      standardsTags: ["5.11A"],
+      difficulty: "easy",
     },
     {
       id: "ela-2",
@@ -33,6 +35,8 @@ export const READING_CONTEXT_DECK: QuestionDeck = {
       ],
       correctOptionId: "b",
       explanation: "Setting details describe where and when the story takes place.",
+      standardsTags: ["7.6A"],
+      difficulty: "medium",
     },
     {
       id: "ela-3",
@@ -45,6 +49,8 @@ export const READING_CONTEXT_DECK: QuestionDeck = {
       ],
       correctOptionId: "c",
       explanation: "An inference is a smart guess based on evidence and context clues.",
+      standardsTags: ["6.6A"],
+      difficulty: "medium",
     },
   ],
 };

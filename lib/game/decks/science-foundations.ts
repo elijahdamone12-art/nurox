@@ -21,6 +21,8 @@ export const SCIENCE_FOUNDATIONS_DECK: QuestionDeck = {
       ],
       correctOptionId: "b",
       explanation: "Mars looks red because iron oxide covers much of its surface.",
+      standardsTags: ["6.9A"],
+      difficulty: "easy",
     },
     {
       id: "science-2",
@@ -33,6 +35,8 @@ export const SCIENCE_FOUNDATIONS_DECK: QuestionDeck = {
       ],
       correctOptionId: "c",
       explanation: "Liquids keep their volume while taking the shape of their container.",
+      standardsTags: ["5.6A"],
+      difficulty: "easy",
     },
     {
       id: "science-3",
@@ -45,6 +49,8 @@ export const SCIENCE_FOUNDATIONS_DECK: QuestionDeck = {
       ],
       correctOptionId: "c",
       explanation: "Gravity is the force that attracts objects toward Earth.",
+      standardsTags: ["8.6A"],
+      difficulty: "easy",
     },
   ],
 };

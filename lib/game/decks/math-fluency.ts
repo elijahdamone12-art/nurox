@@ -21,6 +21,8 @@ export const MATH_FLUENCY_DECK: QuestionDeck = {
       ],
       correctOptionId: "b",
       explanation: "Nine groups of six equals fifty-four.",
+      standardsTags: ["4.4B"],
+      difficulty: "easy",
     },
     {
       id: "math-2",
@@ -33,6 +35,8 @@ export const MATH_FLUENCY_DECK: QuestionDeck = {
       ],
       correctOptionId: "c",
       explanation: "Four out of eight simplifies to one-half.",
+      standardsTags: ["4.3C"],
+      difficulty: "medium",
     },
     {
       id: "math-3",
@@ -45,6 +49,8 @@ export const MATH_FLUENCY_DECK: QuestionDeck = {
       ],
       correctOptionId: "a",
       explanation: "Dividing by ten moves the decimal one place left.",
+      standardsTags: ["5.3C"],
+      difficulty: "easy",
     },
   ],
 };

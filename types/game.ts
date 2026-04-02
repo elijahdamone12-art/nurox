@@ -13,6 +13,8 @@ export type QuestionCard = {
   options: QuestionOption[];
   correctOptionId: string;
   explanation?: string;
+  standardsTags?: string[];
+  difficulty?: "easy" | "medium" | "hard";
 };
 
 export type DeckMetadata = {
